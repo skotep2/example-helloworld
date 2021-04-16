@@ -1,9 +1,19 @@
+//! Program state processor
+
+pub mod processor;
+
+use crate::{
+    processor::Processor,
+};
+use spl_pausable::pausable::Pausable;
+
 use byteorder::{ByteOrder, LittleEndian};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint,
     entrypoint::ProgramResult,
     msg,
+    program_pack::Pack,
     program_error::ProgramError,
     pubkey::Pubkey,
 };
@@ -15,39 +25,55 @@ entrypoint!(process_instruction);
 // Program entrypoint's implementation
 fn process_instruction(
     program_id: &Pubkey, // Public key of the account the hello world program was loaded into
-    accounts: &[AccountInfo], // The account to say hello to
-    _instruction_data: &[u8], // Ignored, all helloworld instructions are hellos
+    accounts: &[AccountInfo], // The program metadata and account to say hello to
+    instruction_data: &[u8], // instructions
 ) -> ProgramResult {
-    msg!("Helloworld Rust program entrypoint");
+    msg!("Helloworld Pausable Rust program entrypoint");
+    match Processor::process(program_id, accounts, instruction_data) {
+        Ok(true) => {
+            msg!("Process completed and we are done.");
+            return Ok(())
+        },
+        Ok(false) => msg!("it was not an ownable or pausable instruction, proceeding with Greeting"),
+        Err(e) => {
+            msg!("Process failed with ERROR: {:?}", &e.to_string());
+            return Err(e)
+        }
+    }
+    msg!("Time to say Hello");
 
-    // Iterating accounts is safer then indexing
     let accounts_iter = &mut accounts.iter();
+    let security = next_account_info(accounts_iter)?; // TODO don't need this
+    let pgm = Pausable::unpack_from_slice(&security.data.borrow())?;
+    if pgm.paused {
+        msg!("Program is PAUSED!");
+        return Ok(());
+    }
 
-    // Get the account to say hello to
-    let account = next_account_info(accounts_iter)?;
-
-    // The account must be owned by the program in order to modify its data
-    if account.owner != program_id {
+    let greeted = next_account_info(accounts_iter)?;
+    if greeted.owner != program_id {
         msg!("Greeted account does not have the correct program id");
         return Err(ProgramError::IncorrectProgramId);
     }
 
     // The data must be large enough to hold a u32 count
-    if account.try_data_len()? < mem::size_of::<u32>() {
+    if greeted.try_data_len()? < mem::size_of::<u32>() {
         msg!("Greeted account data length too small for u32");
         return Err(ProgramError::InvalidAccountData);
     }
 
     // Increment and store the number of times the account has been greeted
-    let mut data = account.try_borrow_mut_data()?;
+    let mut data = greeted.try_borrow_mut_data()?;
     let mut num_greets = LittleEndian::read_u32(&data);
+    msg!("incrementing num greets");
     num_greets += 1;
     LittleEndian::write_u32(&mut data[0..], num_greets);
 
-    msg!("Hello!");
+    msg!("Hello! {:?} times", num_greets);
 
     Ok(())
 }
+
 
 // Sanity tests
 #[cfg(test)]

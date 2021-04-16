@@ -24,6 +24,9 @@ import {url, urlTls} from './util/url';
 import {Store} from './util/store';
 import {newAccountWithLamports} from './util/new-account-with-lamports';
 
+import * as Layout from './util/layout';
+
+
 /**
  * Connection to the network
  */
@@ -38,6 +41,8 @@ let payerAccount: Account;
  * Hello world's program id
  */
 let programId: PublicKey;
+
+let securityPubkey: PublicKey;
 
 /**
  * The public key of the account we are saying hello to
@@ -54,6 +59,15 @@ const greetedAccountDataLayout = BufferLayout.struct([
 ]);
 
 /**
+ * Layout of the program security account data
+ */
+const securityAccountDataLayout = BufferLayout.struct([
+  BufferLayout.u32('ownerOption'),
+  Layout.publicKey('owner'),
+  BufferLayout.u8('paused'),
+]);
+
+/**
  * Establish a connection to the cluster
  */
 export async function establishConnection(): Promise<void> {
@@ -66,6 +80,13 @@ export async function establishConnection(): Promise<void> {
  * Establish an account to pay for everything
  */
 export async function establishPayer(): Promise<void> {
+  try {
+    const config = await new Store().load('payer.json');
+    payerAccount = new Account(Uint8Array.from(config.secretKey.split(',').map(Number)))
+    console.log('loaded previous payer from payer.json')
+  } catch (e) {
+    // pass
+  }
   if (!payerAccount) {
     let fees = 0;
     const {feeCalculator} = await connection.getRecentBlockhash();
@@ -88,6 +109,8 @@ export async function establishPayer(): Promise<void> {
 
     // Fund a new payer via airdrop
     payerAccount = await newAccountWithLamports(connection, fees);
+
+    await new Store().save('payer.json', { secretKey: payerAccount.secretKey.toString() });
   }
 
   const lamports = await connection.getBalance(payerAccount.publicKey);
@@ -110,9 +133,12 @@ export async function loadProgram(): Promise<void> {
   try {
     const config = await store.load('config.json');
     programId = new PublicKey(config.programId);
+    securityPubkey = new PublicKey(config.securityPubkey);
     greetedPubkey = new PublicKey(config.greetedPubkey);
     await connection.getAccountInfo(programId);
     console.log('Program already loaded to account', programId.toBase58());
+    console.log('security', securityPubkey.toBase58());
+    console.log('greeted ', greetedPubkey.toBase58());
     return;
   } catch (err) {
     // try to load the program
@@ -132,48 +158,57 @@ export async function loadProgram(): Promise<void> {
   programId = programAccount.publicKey;
   console.log('Program loaded to account', programId.toBase58());
 
-  // Create the greeted account
-  const greetedAccount = new Account();
-  greetedPubkey = greetedAccount.publicKey;
-  console.log('Creating account', greetedPubkey.toBase58(), 'to say hello to');
-  const space = greetedAccountDataLayout.span;
-  const lamports = await connection.getMinimumBalanceForRentExemption(
-    greetedAccountDataLayout.span,
-  );
-  const transaction = new Transaction().add(
-    SystemProgram.createAccount({
-      fromPubkey: payerAccount.publicKey,
-      newAccountPubkey: greetedPubkey,
-      lamports,
-      space,
-      programId,
-    }),
-  );
-  await sendAndConfirmTransaction(
-    connection,
-    transaction,
-    [payerAccount, greetedAccount],
-    {
-      commitment: 'singleGossip',
-      preflightCommitment: 'singleGossip',
-    },
-  );
+  async function createAccount(dataLayout: BufferLayout): Promise<PublicKey> {
+      // Create the new account
+      const newAccount = new Account();
+      const pubkey = newAccount.publicKey;
+      console.log('Creating account', pubkey.toBase58());
+      const space = dataLayout.span;
+      const lamports = await connection.getMinimumBalanceForRentExemption(space);
+      const transaction = new Transaction().add(
+        SystemProgram.createAccount({
+          fromPubkey: payerAccount.publicKey,
+          newAccountPubkey: pubkey,
+          lamports,
+          space,
+          programId,
+        }),
+      );
+      await sendAndConfirmTransaction(
+        connection,
+        transaction,
+        [payerAccount, newAccount],
+        {
+          commitment: 'singleGossip',
+          preflightCommitment: 'singleGossip',
+        },
+      );
+      return newAccount.publicKey;
+  }
+  securityPubkey = await createAccount(securityAccountDataLayout);
+  greetedPubkey = await createAccount(greetedAccountDataLayout);
 
   // Save this info for next time
   await store.save('config.json', {
     url: urlTls,
     programId: programId.toBase58(),
+    securityPubkey: securityPubkey.toBase58(),
     greetedPubkey: greetedPubkey.toBase58(),
   });
+
+  reportOwner()
 }
 
 /**
  * Say hello
  */
 export async function sayHello(): Promise<void> {
-  console.log('Saying hello to', greetedPubkey.toBase58());
+  console.log('Saying hello to', greetedPubkey.toBase58(), 'security', securityPubkey.toBase58());
   const instruction = new TransactionInstruction({
-    keys: [{pubkey: greetedPubkey, isSigner: false, isWritable: true}],
+    keys: [
+      {pubkey: securityPubkey, isSigner: false, isWritable: true},
+      {pubkey: greetedPubkey, isSigner: false, isWritable: true},
+    ],
     programId,
     data: Buffer.alloc(0), // All instructions are hellos
   });
@@ -186,12 +221,14 @@ export async function sayHello(): Promise<void> {
       preflightCommitment: 'singleGossip',
     },
   );
+  console.log('sayHello done')
 }
 
 /**
  * Report the number of times the greeted account has been said hello to
  */
 export async function reportHellos(): Promise<void> {
+  console.log('Report Hellos to', greetedPubkey.toBase58());
   const accountInfo = await connection.getAccountInfo(greetedPubkey);
   if (accountInfo === null) {
     throw 'Error: cannot find the greeted account';
@@ -202,5 +239,183 @@ export async function reportHellos(): Promise<void> {
     'has been greeted',
     info.numGreets.toString(),
     'times',
+  );
+}
+
+export async function reportOwner(): Promise<void> {
+  const accountInfo = await connection.getAccountInfo(securityPubkey);
+  if (accountInfo === null) {
+    throw 'Error: cannot find the program account';
+  }
+  const info = securityAccountDataLayout.decode(Buffer.from(accountInfo.data));
+  console.log(
+    'CLIENT',
+    securityPubkey.toBase58(),
+    info.ownerOption === 0 ? 'has NO owner' : 
+    ('has owner ' + new PublicKey(info.owner,).toBase58()),
+  );
+}
+
+
+export async function initializeOwnership(): Promise<void> {
+  console.log('Initializing Owner to Payer', payerAccount.publicKey.toBase58());
+  const accountInfo = await connection.getAccountInfo(securityPubkey);
+  if (accountInfo) {
+    const info = securityAccountDataLayout.decode(Buffer.from(accountInfo.data));
+    if (info.ownerOption !== 0) {
+      console.log('... already owned by', new PublicKey(info.owner,).toBase58());
+      return
+    }
+  }
+
+  const dataLayout = BufferLayout.struct([
+    BufferLayout.u8('instruction'),
+    Layout.publicKey('owner'),
+  ])
+  const data = Buffer.alloc(dataLayout.span);
+  dataLayout.encode({instruction: 0 /* InitializeOwnership */}, data);
+
+  const instruction = new TransactionInstruction({
+    keys: [
+      {pubkey: securityPubkey, isSigner: false, isWritable: true},
+      {pubkey: payerAccount.publicKey, isSigner: false, isWritable: false},
+    ],
+    programId,
+    data,
+  });
+  await sendAndConfirmTransaction(
+    connection,
+    new Transaction().add(instruction),
+    [payerAccount],
+    {
+      commitment: 'singleGossip',
+      preflightCommitment: 'singleGossip',
+    },
+  );
+}
+  
+export async function transferOwnershipToGreeted(): Promise<void> {
+  console.log('Transfer ownership to Greeted', greetedPubkey.toBase58());
+  return _transferOwnership(payerAccount.publicKey, greetedPubkey)
+}
+
+export async function transferOwnershipToPayer(): Promise<void> {
+  console.log('Transfer ownership to Payer', payerAccount.publicKey.toBase58());
+  return _transferOwnership(greetedPubkey, payerAccount.publicKey)
+}
+
+async function _transferOwnership(currentOwnerPubkey: PublicKey, newOwnerPubkey: PublicKey) {
+  const dataLayout = BufferLayout.struct([
+    BufferLayout.u8('instruction'),
+    Layout.publicKey('owner'),
+  ])
+  const data = Buffer.alloc(dataLayout.span);
+  dataLayout.encode({
+    instruction: 1 /* TransferOwnership */,
+    //owner: Buffer.from(newOwnerPubkey.toBuffer()), // TODO get this working
+  }, data);
+
+  const instruction = new TransactionInstruction({
+    keys: [
+      {pubkey: securityPubkey, isSigner: false, isWritable: true},
+      {pubkey: currentOwnerPubkey, isSigner: false, isWritable: false},
+      {pubkey: newOwnerPubkey, isSigner: false, isWritable: false},
+    ],
+    programId,
+    data,
+  });
+  await sendAndConfirmTransaction(
+    connection,
+    new Transaction().add(instruction),
+    [payerAccount],
+    {
+      commitment: 'singleGossip',
+      preflightCommitment: 'singleGossip',
+    },
+  );
+}
+ 
+export async function reportPaused(): Promise<void> {
+  const accountInfo = await connection.getAccountInfo(securityPubkey);
+  if (accountInfo === null) {
+    throw 'Error: cannot find the program account';
+  }
+  const info = securityAccountDataLayout.decode(Buffer.from(accountInfo.data));
+  console.log(
+    'CLIENT',
+    securityPubkey.toBase58(),
+    info.paused ? 'is paused' : 'is not paused',
+  );
+}
+
+export async function pauseByPayer(): Promise<void> {
+    console.log('Pausing by Payer');
+    return _pause(payerAccount.publicKey)
+}
+
+export async function pauseByGreeted(): Promise<void> {
+    console.log('Pausing by Greeter');
+    return _pause(greetedPubkey)
+}
+
+export async function resumeByPayer(): Promise<void> {
+    console.log('Resuming by Payer');
+    return _resume(payerAccount.publicKey)
+}
+
+export async function resumeByGreeted(): Promise<void> {
+    console.log('Resuming by Greeter');
+    return _resume(greetedPubkey)
+}
+
+async function _pause(pausePubkey: PublicKey): Promise<void> {
+  const accountInfo = await connection.getAccountInfo(securityPubkey);
+
+  const dataLayout = BufferLayout.struct([BufferLayout.u8('instruction')])
+  const data = Buffer.alloc(dataLayout.span);
+  dataLayout.encode({instruction: 3 /* Pause */}, data);
+
+  const instruction = new TransactionInstruction({
+    keys: [
+      {pubkey: securityPubkey, isSigner: false, isWritable: true},
+      {pubkey: pausePubkey, isSigner: false, isWritable: false},
+    ],
+    programId,
+    data,
+  });
+  await sendAndConfirmTransaction(
+    connection,
+    new Transaction().add(instruction),
+    [payerAccount],
+    {
+      commitment: 'singleGossip',
+      preflightCommitment: 'singleGossip',
+    },
+  );
+}
+
+async function _resume(resumePubkey: PublicKey): Promise<void> {
+  const accountInfo = await connection.getAccountInfo(securityPubkey);
+
+  const dataLayout = BufferLayout.struct([BufferLayout.u8('instruction')])
+  const data = Buffer.alloc(dataLayout.span);
+  dataLayout.encode({instruction: 4 /* Resume */}, data);
+
+  const instruction = new TransactionInstruction({
+    keys: [
+      {pubkey: securityPubkey, isSigner: false, isWritable: true},
+      {pubkey: resumePubkey, isSigner: false, isWritable: false},
+    ],
+    programId,
+    data,
+  });
+  await sendAndConfirmTransaction(
+    connection,
+    new Transaction().add(instruction),
+    [payerAccount],
+    {
+      commitment: 'singleGossip',
+      preflightCommitment: 'singleGossip',
+    },
   );
 }
